@@ -149,7 +149,7 @@ def get_default_args():
     args.learning_rate = 1e-5 # Slightly lower learning rate for stability
     args.max_train_steps = 2000  # More steps for better convergence
     args.gradient_accumulation_steps = 8  # For effective batch size of 4
-    args.use_8bit_adam = True  # Save memory with 8-bit optimizer
+    args.use_8bit_adam = False  # Save memory with 8-bit optimizer
     args.mixed_precision = "no"  # Changed back to fp16
     args.clip_grad_norm = 0.0
     
@@ -186,7 +186,7 @@ def train():
     # Initialize accelerator
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
-        mixed_precision=args.mixed_precision,  # Always use fp16
+        mixed_precision=args.mixed_precision,
         split_batches=True,
     )
     
@@ -194,7 +194,7 @@ def train():
     print("Loading FLUX pipeline...")
     pipeline = FluxPipeline.from_pretrained(
         args.pretrained_model_name,
-        torch_dtype=torch.float16,  # Always use float16
+        torch_dtype=torch.float16,
     )
 
     # Extract components
@@ -211,9 +211,6 @@ def train():
         "to_q",  # Query projection
         "to_k",  # Key projection
         "to_v",  # Value projection
-        # "to_out.0",  # Output projection
-        # "ff.net.0.proj",  # MLP first projection
-        # "ff.net.2",  # MLP second projection
     ]
     
     lora_config = LoraConfig(
@@ -222,8 +219,6 @@ def train():
         target_modules=target_modules,
         lora_dropout=args.lora_dropout,
         inference_mode=False,
-        # bias="none",
-        # task_type=TaskType.FEATURE_EXTRACTION
     )
     
     # Apply LoRA to transformer model
@@ -278,9 +273,8 @@ def train():
         num_warmup_steps=args.lr_warmup_steps
     )
 
-
-    # Prepare for accelerator
-    print("PREPARE TRANSFORMER")
+    # Setup for training
+    training_models = [transformer]
     transformer, optimizer, dataloader = accelerator.prepare(
         transformer, optimizer, dataloader
     )
@@ -292,28 +286,29 @@ def train():
     text_encoder_2 = text_encoder_2.to(device).to(torch.float16)
     transformer = transformer.to(device).to(torch.float16)
     
-    # Training loop
-    print("BEGIN INIT TRAINING ")
-    global_step = 0
+    # Set up loss recorder and progress bar
+    loss_recorder = LossRecorder()
+    num_train_epochs = max(1, args.max_train_steps // len(dataloader) + 1)
     progress_bar = tqdm(range(args.max_train_steps), desc="Training")
-    
-    # Set models to eval mode
-    vae.eval()
-    text_encoder.eval()
-    text_encoder_2.eval()
     
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
     
+    # Global variables
+    global_step = 0
+    weight_dtype = torch.float16
+    
     # Training loop
-    print("BEGIN TRAINING LOOP ")
-    # torch.manual_seed(55)
-    transformer.train()
-    while global_step < args.max_train_steps:
-        print(f"global step: {global_step}")
-        for batch in dataloader:
+    print("BEGIN TRAINING LOOP")
+    for epoch in range(num_train_epochs):
+        accelerator.print(f"\nepoch {epoch+1}/{num_train_epochs}")
+        
+        # Set models to train mode
+        transformer.train()
+        
+        for step, batch in enumerate(dataloader):
             with accelerator.accumulate(transformer):
-                # Process inputs in float16
+                # Process inputs
                 images = batch["images"].to(device, dtype=torch.float16)
                 clip_input_ids = batch["clip_input_ids"].to(device)
                 clip_attention_mask = batch["clip_attention_mask"].to(device)
@@ -339,6 +334,11 @@ def train():
                     # Process latents
                     latents = vae.encode(images).latent_dist.sample().to(torch.float16) * 0.18215
                     
+                    # NaN check
+                    if torch.any(torch.isnan(latents)):
+                        accelerator.print("NaN found in latents, replacing with zeros")
+                        latents = torch.nan_to_num(latents, 0, out=latents)
+                    
                     # Pack latents
                     batch_size, num_channels, height, width = latents.shape
                     latents = pipeline._pack_latents(latents, batch_size, num_channels, height, width)
@@ -349,12 +349,9 @@ def train():
                     )
                     text_ids = torch.zeros(prompt_embeds.shape[1], 3, device=device, dtype=torch.float16)   
 
-                    if torch.any(torch.isnan(latents)):
-                        print("latents: NAN")
-
-                    # Get noised latents
-                    # Sample noise that we'll add to the latents
-                    noisy_latents, noise, timesteps, _ = get_noisy_model_input_and_timestep(
+                    # Sample noise and get noisy latents
+                    noise = torch.randn_like(latents)
+                    noisy_latents, noise, timesteps, sigmas = get_noisy_model_input_and_timestep(
                         args,
                         latents=latents,
                         noise_scheduler=noise_scheduler,
@@ -362,43 +359,24 @@ def train():
                         dtype=torch.float16
                     )
 
-                    # Ensure float16
-                    # latents = noise_scheduler.step(noise_pred, t, latents, return_dict=False)[0]
-                    noisy_latents = noisy_latents.to(torch.float16)
-                    noise = noise.to(torch.float16)
-
-                # Forward pass
                 # Forward pass through transformer
-                def call_transformer(noisy_latents, timesteps, pooled_prompt_embeds, prompt_embeds, guidance, text_ids, img_ids):
-                    with torch.set_grad_enabled(True), accelerator.autocast():
-                        model_pred = transformer(
-                            hidden_states=noisy_latents,
-                            timestep=timesteps /1000,
-                            pooled_projections=pooled_prompt_embeds,
-                            encoder_hidden_states=prompt_embeds,
-                            guidance=guidance,
-                            txt_ids=text_ids,
-                            img_ids=img_ids,
-                            return_dict=False,
-                        )[0]
-                    return model_pred
                 optimizer.zero_grad()
-                model_pred = call_transformer(noisy_latents, timesteps, pooled_prompt_embeds, prompt_embeds, guidance, text_ids, img_ids)
+                with accelerator.autocast():
+                    model_pred = transformer(
+                        hidden_states=noisy_latents,
+                        timestep=timesteps / 1000,
+                        pooled_projections=pooled_prompt_embeds,
+                        encoder_hidden_states=prompt_embeds,
+                        guidance=guidance,
+                        txt_ids=text_ids,
+                        img_ids=img_ids,
+                        return_dict=False,
+                    )[0]
+                
                 # Calculate loss
                 target = noise - latents
+                loss = F.mse_loss(model_pred, noise)
                 
-                # LOSS FUNCTION
-                # loss = train_util.conditional_loss(model_pred.float(), target.float(), args.loss_type, "none", huber_c)
-                if torch.any(torch.isnan(model_pred)):
-                    print("model_pred: NAN")
-                if torch.any(torch.isnan(target)):
-                    print("target: NAN")
-
-                loss = torch.nn.functional.mse_loss(model_pred, target)
-
-                print(f"Current learning rate: {optimizer.param_groups[0]['lr']:.8f}")
-                print(f"backpropagating loss: Step {global_step}: loss = {loss.item()}")
-
                 # Backward pass
                 accelerator.backward(loss)
                 
@@ -409,43 +387,48 @@ def train():
                 if has_bad_grads:
                     print("WARNING: Bad gradients detected, skipping update")
                     optimizer.zero_grad()
-                    global_step += 1
-                    continue
-                
-                # Clip gradients
-                torch.nn.utils.clip_grad_norm_(transformer.parameters(), args.clip_grad_norm)
-                optimizer.step()
-                lr_scheduler.step()
-                optimizer.zero_grad()
-
-                
-                # Print gradient norms for specific layers (optional)
-                if global_step % 100 == 0:
-                    for name, param in transformer.named_parameters():
-                        if param.grad is not None and "lora" in name.lower():
-                            grad_norm = param.grad.norm().item()
-                            print(f"Gradient norm for {name}: {grad_norm:.6f}")
-                
+                else:
+                    # Clip gradients
+                    if accelerator.sync_gradients and args.clip_grad_norm > 0.0:
+                        accelerator.clip_grad_norm_(transformer.parameters(), args.clip_grad_norm)
+                        
+                    optimizer.step()
+                    lr_scheduler.step()
+                    optimizer.zero_grad()
             
-            # Update progress
-            if accelerator.is_main_process:
+            # Checks if the accelerator has performed an optimization step behind the scenes
+            if accelerator.sync_gradients:
                 progress_bar.update(1)
+                global_step += 1
                 
-                if global_step % 100 == 0:
-                    print(f"Step {global_step}: loss = {loss.item()}")
-                
-                # Save checkpoint
-                if global_step % 500 == 0 and global_step > 0:
+                # Save checkpoint at specified intervals
+                if global_step % 500 == 0 and global_step > 0 and accelerator.is_main_process:
                     # Unwrap the model
                     unwrapped_transformer = accelerator.unwrap_model(transformer)
                     
                     # Save LoRA weights
                     unwrapped_transformer.save_pretrained(os.path.join(args.output_dir, f"checkpoint-{global_step}"))
-                    # display_image(pipeline)
             
-            global_step += 1
+            # Log loss
+            current_loss = loss.detach().item()
+            loss_recorder.add(epoch=epoch, step=step, loss=current_loss)
+            avr_loss = loss_recorder.moving_average
+            logs = {"avr_loss": avr_loss, "lr": optimizer.param_groups[0]['lr']}
+            progress_bar.set_postfix(**logs)
+            
+            # Print debugging info
+            if global_step % 100 == 0:
+                print(f"Step {global_step}: loss = {loss.item()}, lr = {optimizer.param_groups[0]['lr']:.8f}")
+                # Print gradient norms for specific layers (optional)
+                for name, param in transformer.named_parameters():
+                    if param.grad is not None and "lora" in name.lower():
+                        grad_norm = param.grad.norm().item()
+                        print(f"Gradient norm for {name}: {grad_norm:.6f}")
+            
             if global_step >= args.max_train_steps:
                 break
+        
+        accelerator.wait_for_everyone()
     
     # Save final model
     if accelerator.is_main_process:
@@ -454,8 +437,24 @@ def train():
         # Save LoRA weights
         unwrapped_transformer.save_pretrained(args.output_dir)
         print(f"Model saved to {args.output_dir}")
-    
-    # Close wandb
+
+
+# Simple loss recorder class to track losses
+class LossRecorder:
+    def __init__(self, window_size=100):
+        self.losses = []
+        self.window_size = window_size
+        
+    def add(self, epoch, step, loss):
+        self.losses.append(loss)
+        if len(self.losses) > self.window_size:
+            self.losses.pop(0)
+            
+    @property
+    def moving_average(self):
+        if not self.losses:
+            return 0.0
+        return sum(self.losses) / len(self.losses)
 
 def forward_for_training(
     self,
